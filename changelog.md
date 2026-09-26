@@ -1,4 +1,7 @@
 Version 0.1.07
+- Bug fixed
+
+Version 0.1.07
 - RS41-SGM data are reported to wettersonde.net
 - Bugs fixed
   
