@@ -95,6 +95,62 @@ static void appendDecoderJsonLog(const TelemetryFrame& frame) {
     out << line << '\n';
 }
 
+static constexpr auto kSondeLogMaxAge = std::chrono::hours(24);
+static constexpr auto kSondeLogCleanupInterval = std::chrono::minutes(10);
+
+static void cleanupOldSondeLogs(Logger& log) {
+    const std::filesystem::path dir = std::filesystem::path(g_base_dir) / "logs" / "sondes";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return;
+
+    const auto now = std::filesystem::file_time_type::clock::now();
+    size_t removed = 0;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code fec;
+        if (!entry.is_regular_file(fec) || entry.path().extension() != ".json") continue;
+        const auto mtime = std::filesystem::last_write_time(entry.path(), fec);
+        if (fec) continue;
+        if (now - mtime > kSondeLogMaxAge) {
+            if (std::filesystem::remove(entry.path(), fec) && !fec) {
+                ++removed;
+            } else if (fec) {
+                log.warn("could not delete old sonde log " + entry.path().string() + ": " + fec.message());
+            }
+        }
+    }
+    if (removed > 0) {
+        log.info("deleted " + std::to_string(removed) + " sonde log(s) older than 24h");
+    }
+}
+
+static constexpr auto kLogTruncateInterval = std::chrono::hours(12);
+
+static void truncateLogsIfDue(Logger& log) {
+    const std::filesystem::path dir = std::filesystem::path(g_base_dir) / "logs";
+    const std::filesystem::path marker = dir / ".logs_cleared";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return;
+
+    const auto now = std::filesystem::file_time_type::clock::now();
+    if (!std::filesystem::exists(marker, ec)) {
+        std::ofstream(marker, std::ios::trunc);  // start the 12h timer now
+        return;
+    }
+    const auto last = std::filesystem::last_write_time(marker, ec);
+    if (ec || now - last < kLogTruncateInterval) return;
+
+    for (const char* name : {"wsrx.log", "wsrx-web.log"}) {
+        const std::filesystem::path file = dir / name;
+        std::error_code fec;
+        if (!std::filesystem::exists(file, fec)) continue;
+        std::filesystem::resize_file(file, 0, fec);
+        if (fec) log.warn("could not clear " + file.string() + ": " + fec.message());
+    }
+    std::filesystem::last_write_time(marker, now, ec);
+    log.info("wsrx.log and wsrx-web.log cleared (every 12h)");
+}
+
 static bool fileExists(const std::string& path) {
     std::error_code ec;
     return std::filesystem::exists(path, ec);
@@ -1707,9 +1763,18 @@ int main(int argc, char** argv) {
         scan_thread = std::thread(scanWorkerThread, std::cref(cfg), std::ref(log), std::ref(channels),
                                   std::ref(channels_mutex), std::ref(uploader), std::ref(udp_sender));
 
+        cleanupOldSondeLogs(log);
+        truncateLogsIfDue(log);
+        auto last_log_cleanup = std::chrono::steady_clock::now();
 
         while (!g_shutdown) {
             uploader.maybeSendReceiverPosition();
+
+            if (std::chrono::steady_clock::now() - last_log_cleanup >= kSondeLogCleanupInterval) {
+                last_log_cleanup = std::chrono::steady_clock::now();
+                cleanupOldSondeLogs(log);
+                truncateLogsIfDue(log);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(channels_mutex);
